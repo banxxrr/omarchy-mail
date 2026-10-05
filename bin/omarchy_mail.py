@@ -20,7 +20,7 @@ from email.parser import BytesParser
 from email.utils import formatdate, getaddresses, parsedate_to_datetime
 from imaplib import IMAP4, IMAP4_SSL
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Iterator
 
 PAGE = 50
 IMAP_TIMEOUT = 30
@@ -1911,20 +1911,29 @@ def list_cmd(state: State, req: dict[str, Any]) -> dict[str, Any]:
         return state.with_session(acc["id"], lambda account, imap: list_account(account, imap, mailbox, limit, query))
 
     unread = 0
-    by_account: dict[str, int] = {}
     rows: list[dict[str, Any]] = []
+    parts: list[tuple[str, int, list[dict[str, Any]]]] = []
     # Each account has its own IMAP socket keyed by account id, so the threads never share one.
     with ThreadPoolExecutor(max_workers=max(1, min(len(accounts), 8))) as pool:
         for acc, (count, part) in zip(accounts, pool.map(one, accounts)):
             unread += count
-            by_account[str(acc["id"])] = count
+            parts.append((str(acc["id"]), count, part))
             rows.extend(part)
     contacts = collect_contacts(accounts, rows)
     conversations = group_rows(rows, mailbox)
     if len(conversations) > limit:
         conversations = conversations[:limit]
     if not query.strip():
-        save_list_cache(conversations, contacts, by_account, mailbox)
+        if len(parts) == 1:
+            aid, count, _part = parts[0]
+            save_list_cache(conversations, contacts, {aid: count}, mailbox)
+        else:
+            # The merged page keeps only the newest `limit` across accounts. Cache each
+            # account's own page instead, so the "all" view doesn't shrink a single
+            # account's cache to its share of the merged list.
+            for aid, count, part in parts:
+                own = group_rows(part, mailbox)[:limit]
+                save_list_cache(own, collect_contacts(accounts, part), {aid: count}, mailbox)
     return {
         "id": req["id"],
         "ok": True,
@@ -1935,9 +1944,12 @@ def list_cmd(state: State, req: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def list_responses(state: State, req: dict[str, Any]) -> list[dict[str, Any]]:
+def list_responses(state: State, req: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    # A generator, so main() writes the cached page before the IMAP round trip
+    # starts instead of holding it back until the live page is ready.
     mailbox = str(req.get("mailbox") or "inbox") or "inbox"
-    out: list[dict[str, Any]] = []
+    limit = int(req.get("limit") or PAGE)
+    sent_cached = False
     if req.get("useCache", True) and not str(req.get("query") or "").strip():
         try:
             accounts = state.selected_accounts(str(req.get("account") or ""))
@@ -1946,22 +1958,22 @@ def list_responses(state: State, req: dict[str, Any]) -> list[dict[str, Any]]:
         cached = load_list_cache(accounts, mailbox) if accounts else None
         if cached:
             unread, conversations, contacts = cached
-            out.append(
-                {
-                    "id": req["id"],
-                    "ok": True,
-                    "cached": True,
-                    "unread": unread,
-                    "conversations": conversations,
-                    "contacts": contacts,
-                }
-            )
+            sent_cached = True
+            yield {
+                "id": req["id"],
+                "ok": True,
+                "cached": True,
+                "unread": unread,
+                "conversations": conversations[:limit],
+                "contacts": contacts,
+            }
     try:
-        out.append(list_cmd(state, req))
+        live = list_cmd(state, req)
     except Exception as exc:
-        if not out:
-            out.append({"id": req["id"], "ok": False, "error": str(exc)})
-    return out
+        if not sent_cached:
+            yield {"id": req["id"], "ok": False, "error": str(exc)}
+        return
+    yield live
 
 
 def fetch_cmd(state: State, req: dict[str, Any]) -> dict[str, Any]:
@@ -2202,7 +2214,7 @@ def attachment_cmd(state: State, req: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def handle(state: State, req: dict[str, Any]) -> list[dict[str, Any]]:
+def handle(state: State, req: dict[str, Any]) -> Iterable[dict[str, Any]]:
     cmd = str(req.get("cmd") or "")
     rid = req.get("id") or ""
     try:
